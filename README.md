@@ -1,5 +1,5 @@
 # CS336 Spring 2026 Assignment 5: Alignment
-
+2026 作业五的完整实现，训练脚本
 For a full description of the assignment, see the assignment handout at
 [cs336_spring2026_assignment5_alignment.pdf](./cs336_spring2026_assignment5_alignment.pdf)
 
