@@ -482,15 +482,49 @@ def main():
     # Load prompt template
     with open(cfg.prompt_path, 'r', encoding='utf-8') as f:
         prompt_template = f.read()
-    # Build training batches
     gsm8k_batch_builder = GSM8KBatchBuilder(cfg, prompt_template)
     train_batches = gsm8k_batch_builder.build_train_batches()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code = True)
+    
     # Initialize vLLM server and Hugging Face model here (not shown)
     # For each training step, generate rollouts, compute rewards, and update the policy
-    for step, (prompts, ground_truth_answers) in enumerate(train_batches):
-        # Generate rollouts using vLLM
-        # Compute rewards using r1_zero_reward_fn
-        # Compute policy gradient loss
-        # Update the model using grpo_train_step
-        pass  # Placeholder for the actual training loop logic
+    server = VLLMServer(
+        model_id = cfg.model_path,
+        host = "127.0.0.1",
+        port = 8000,
+        gpu = cfg.vllm_gpu,
+        seed = cfg.seed,
+        gpu_memory_utilization = cfg.gpu_memory_utilization,
+    )
+    
+    policy = AutoModelForCausalLM.from_pretrained(
+        cfg.model_path,
+        torch_dtype = torch.bfloat16,
+        trust_remote_code = True
+    ).to(cfg.train_device)
+    
+    policy.train()
+    
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr = cfg.learning_rate,
+    )
+    
+    try:
+        server.start()
+        server.init_weight_sync(
+            policy_device = cfg.train_device
+        )
+        history = run_grpo_train_loop(
+            cfg,
+            train_batches,
+            r1_zero_reward_fn,
+            server,
+            policy,
+            optimizer = optimizer,
+            tokenizer = tokenizer
+        )
+    finally:
+        server.stop()
+if __name__ = "__main__":
+    main()
