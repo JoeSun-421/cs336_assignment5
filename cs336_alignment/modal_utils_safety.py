@@ -21,6 +21,7 @@ from cs336_alignment.modal_utils import (
 
 app = modal.App(f"cs336-a5-supplement-{SUNET_ID}")
 
+# 训练数据和模型放在共享 volume；结果单独挂载，便于任务结束后持久化。
 SHARED_VOLUME_NAME = "cs336-a5-supplement"
 SHARED_VOLUME_ENVIRONMENT = "cs336-shared-data"
 SHARED_VOLUME_MOUNT_PATH = "/mnt/cs336-a5-supplement"
@@ -56,6 +57,7 @@ VOLUME_MOUNTS = {
     secrets=[wandb_secret],
 )
 def run_command(command: list[str]) -> str:
+    """运行 safety supplement 命令，并确保结果 volume 最终提交。"""
     command_str = quote_command(command)
     print(command_str, flush=True)
     try:
@@ -66,6 +68,7 @@ def run_command(command: list[str]) -> str:
 
 
 def submit_commands(commands: list[list[str]]) -> None:
+    """提交补充实验并汇总失败任务，便于一次性检查整批运行结果。"""
     print(
         f"Submitting {len(commands)} Modal supplement jobs "
         f"with max_containers={MAX_CONTAINERS}, gpu={GPU}, "

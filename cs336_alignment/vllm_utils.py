@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VLLMCompletion:
+    """vLLM 单条 completion 的文本、token id 和结束原因。"""
     text: str
     token_ids: list[int]
     finish_reason: str | None
@@ -27,6 +29,7 @@ class VLLMCompletion:
 
 @dataclass
 class VLLMServer:
+    """封装 vLLM server 的启动、健康检查、生成和权重同步生命周期。"""
     model_id: str
     host: str = "127.0.0.1"
     port: int = 8000
@@ -45,6 +48,7 @@ class VLLMServer:
         self.weight_sync_group = None
 
     def start(self) -> None:
+        # server 已在外部运行时只等待健康检查，不重复创建进程。
         if self.launch_server:
             kill_existing_vllm_server(self.port)
             self.process = start_server(
@@ -68,6 +72,7 @@ class VLLMServer:
         return self.weight_sync_group
 
     def sync_policy_weights(self, policy: torch.nn.Module) -> None:
+        # 权重同步前必须先建立 trainer 与 vLLM 之间的 NCCL 通道。
         if self.weight_sync_group is None:
             raise RuntimeError("Call init_weight_sync before sync_policy_weights.")
         sync_policy_weights(policy, self.base_url, self.weight_sync_group)
@@ -88,6 +93,7 @@ class VLLMServer:
 
 
 def _http_json(method: str, url: str, payload: dict | None = None, timeout: int = 60) -> dict:
+    """发送 JSON HTTP 请求，并把空响应统一表示为空字典。"""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(
         url,
@@ -103,6 +109,7 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
 
 
 def kill_existing_vllm_server(port: int) -> None:
+    """清理占用目标端口的旧 vLLM 进程，避免新服务启动冲突。"""
     pattern = f"vllm serve .* --port {port}"
     try:
         result = subprocess.run(["pkill", "-TERM", "-f", pattern], check=False)
@@ -127,8 +134,17 @@ def start_server(
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level
-    command = [
+    vllm_executable = os.path.join(
+        os.path.dirname(sys.executable),
         "vllm",
+    )
+    if not os.path.isfile(vllm_executable):
+        # Fall back to PATH when the active interpreter is not a virtualenv
+        # interpreter with a colocated console script.
+        vllm_executable = "vllm"
+
+    command = [
+        vllm_executable,
         "serve",
         model_id,
         "--host",
@@ -154,6 +170,7 @@ def start_server(
 
 
 def wait_for_server(base_url: str, process: subprocess.Popen | None, timeout: int) -> None:
+    """轮询 health endpoint，并在子进程提前退出或超时时报告原因。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
@@ -184,9 +201,11 @@ def generate_completions(
     sampling_params: dict,
     batch_size: int | None = None,
 ) -> list[VLLMCompletion]:
+    """按可选 batch size 调用 OpenAI-compatible completion API。"""
     if batch_size is not None and batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
+    # 分批只影响请求大小，不改变 prompt 的顺序和最终 completion 顺序。
     prompt_batches = [prompts]
     if batch_size is not None:
         prompt_batches = [prompts[start : start + batch_size] for start in range(0, len(prompts), batch_size)]
@@ -220,6 +239,7 @@ def generate_completions(
 
 
 def init_weight_sync(vllm_base_url: str, policy_device: str):
+    """建立 trainer rank 与 vLLM inference ranks 之间的 NCCL 权重传输组。"""
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
 
@@ -262,6 +282,7 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
         NCCLWeightTransferEngine,
     )
 
+    # 发送参数名、dtype 和 shape，vLLM 据此接收打包后的参数缓冲区。
     weights = list(policy.named_parameters())
     update_info = {
         "names": [name for name, _ in weights],

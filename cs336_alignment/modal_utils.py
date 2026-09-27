@@ -27,11 +27,13 @@ import subprocess
 import modal
 
 
+# SUNET_ID 用于隔离课程作业的 Modal app、W&B secret 和远程资源命名空间。
 SUNET_ID = "TODO"  # NOTE: modal_utils.py should remain unchanged other than adding your SUNET_ID.
 if SUNET_ID == "TODO":
     raise ValueError("Please set SUNET_ID in cs336_alignment/modal_utils.py before running Modal jobs.")
 
 
+# 这些常量同时控制远程 GPU 数量、容器并发和单个任务超时。
 GPU = "B200:2"
 MAX_CONTAINERS = 4
 REMOTE_ROOT = "/root"
@@ -42,6 +44,7 @@ app = modal.App(f"cs336-a5-rlvr-{SUNET_ID}")
 wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME)
 
 image = (
+    # 远程镜像包含 CUDA、项目依赖和训练所需的本地目录。
     modal.Image.from_registry(
         "nvidia/cuda:12.9.1-devel-ubuntu22.04",
         add_python="3.12",
@@ -60,6 +63,7 @@ image = image.add_local_file("CLAUDE.md", f"{REMOTE_ROOT}/CLAUDE.md")
 
 
 def quote_command(command: list[str]) -> str:
+    """把参数列表安全地转换成可复制的 shell 命令字符串。"""
     return " ".join(shlex.quote(part) for part in command)
 
 
@@ -71,6 +75,7 @@ def quote_command(command: list[str]) -> str:
     secrets=[wandb_secret],
 )
 def run_command(command: list[str]) -> str:
+    """在一个 Modal GPU 容器中执行单条命令，并让失败状态向上抛出。"""
     command_str = quote_command(command)
     print(command_str, flush=True)
     subprocess.run(command, check=True)
@@ -78,6 +83,7 @@ def run_command(command: list[str]) -> str:
 
 
 def submit_commands(commands: list[list[str]]) -> None:
+    """并发提交命令，收集所有失败任务后统一返回失败状态。"""
     print(
         f"Submitting {len(commands)} Modal jobs "
         f"with max_containers={MAX_CONTAINERS}, gpu={GPU}, "

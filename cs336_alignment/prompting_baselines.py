@@ -249,12 +249,14 @@ def write_markdown_report(records: list[dict], summary: dict, path: Path) -> Non
 
 
 def main() -> None:
+    # 先读取命令行配置和 GSM8K 示例，再为每个 prompt 模板构造请求。
     args = parse_args()
     examples = load_examples(args.data_path, args.max_examples)
     selected_names = args.only or list(PROMPT_SPECS)
     records = []
 
     for prompt_name in selected_names:
+        # 每个模板单独生成、评分和记录，便于比较格式正确率与答案正确率。
         spec = PROMPT_SPECS[prompt_name]
         prompts = render_prompts(spec["path"], examples)
         sampling_params = {

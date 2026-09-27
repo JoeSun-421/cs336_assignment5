@@ -10,7 +10,9 @@ import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
-from cs336_alignment.grpo_train_step_standard_on_policy import grpo_train_step
+from cs336_alignment.grpo_train_step import grpo_train_step
+from cs336_alignment.tokenize_prompt_and_output import tokenize_prompt_and_output
+from cs336_alignment.get_response_log_probs import get_response_log_probs
 
 PROJECT_ROOT = (Path(__file__).parent.parent).resolve()
 if str(PROJECT_ROOT) not in sys.path:
@@ -53,7 +55,8 @@ class GRPOConfig:
     sampling_max_tokens: int = 512
     # 遇到这些字符串时停止生成；元组便于作为不可变默认值保存。
     sampling_stop_strings: tuple[str, ...] = ("</answer>",)
-    # 每批新 rollout 重复训练的轮数；标准 on-policy GRPO 固定为 1。
+    # 每批 rollout 的重复训练轮数；off-policy 实验也可通过 train_batch_size
+    # 把一批 rollout 切成多个 optimizer updates。
     epochs_per_rollout_batch: int = 1
     # 一次优化器更新使用的回答数；标准 on-policy 设置与 rollout_batch_size 相同。
     train_batch_size: int = 256
@@ -67,8 +70,10 @@ class GRPOConfig:
     baseline: Literal["mean"] = "mean"
     # 优势归一化方式；std 表示再除以本组奖励的标准差。
     advantage_normalizer: Literal["std"] = "std"
-    # rollout 与当前策略的概率校正方式；none 表示标准 on-policy，不做重要性加权。
-    importance_reweighting_method: Literal["none"] = "none"
+    # rollout 与当前策略的概率校正方式；none 是标准 on-policy，其余选项复用固定旧策略概率。
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none"
+    # PPO/GRPO/GSPO 的裁剪范围 epsilon。
+    cliprange: float = 0.1
     # Loss 聚合方式；sequence 表示先对每条回答的有效 token 求平均，再对回答求平均。
     loss_normalization: Literal["sequence"] = "sequence"
     # vLLM 可使用的 GPU 显存比例，包含模型权重和 KV cache。
@@ -111,16 +116,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling_top_p", type=float, default=defaults.sampling_top_p, help="Nucleus sampling probability threshold; 1.0 means no top-p truncation.")
     parser.add_argument("--sampling_max_tokens", type=int, default=defaults.sampling_max_tokens, help="Maximum number of tokens allowed in each generated response.")
     parser.add_argument("--sampling_stop_strings", type=str, nargs='+', default=defaults.sampling_stop_strings, help="Strings that indicate when to stop generation; multiple strings can be provided.")
-    parser.add_argument("--epochs_per_rollout_batch", type=int, default=defaults.epochs_per_rollout_batch, help="Number of epochs to train on each new rollout batch; standard on-policy GRPO is fixed at 1.")
+    parser.add_argument("--epochs_per_rollout_batch", type=int, default=defaults.epochs_per_rollout_batch, help="Number of passes over each fixed rollout batch.")
     parser.add_argument("--train_batch_size", type=int, default=defaults.train_batch_size, help="Number of responses used in each optimizer update; standard on-policy is the same as rollout_batch_size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=defaults.gradient_accumulation_steps,help="Number of microbatches to accumulate before each optimizer update; e.g., 256 / 32 = 8 responses per microbatch.")
     parser.add_argument("--max_grad_norm", type=float, default=defaults.max_grad_norm, help="Maximum gradient norm; gradients exceeding this will be clipped to limit the update step size.")
     parser.add_argument("--prompt_path", type=str, default=defaults.prompt_path, help="Path to the prompt template file; the question placeholder will be replaced with GSM8K questions.")
     parser.add_argument("--baseline", type=str, choices=["mean"], default=defaults.baseline, help="Baseline for group rewards; 'mean' subtracts the mean reward of the group from each response reward.")
     parser.add_argument("--advantage_normalizer", type=str, choices=["std"], default=defaults.advantage_normalizer, help="Method for advantage normalization; 'std' divides by the standard deviation of the group rewards.")
-    parser.add_argument("--importance_reweighting_method", type=str, choices=["none"], default=defaults.importance_reweighting_method, help="Method for importance reweighting; 'none' indicates standard on-policy GRPO without importance weighting.")
-    parser.add_argument("--loss_normalization", type=str, choices=["sequence"], default=defaults.loss_normalization, help="Method for loss aggregation; 'sequence' averages over valid tokens in each response, then averages over responses.")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=defaults.gpu_memory_utilization, help="Fraction of GPU memory to use for vLLM, including model weights and KV cache.")  
+    parser.add_argument("--importance_reweighting_method", type=str, choices=["none", "noclip", "grpo", "gspo"], default=defaults.importance_reweighting_method, help="Importance reweighting method; off-policy methods reuse fixed rollout log-probabilities.")
+    parser.add_argument("--cliprange", type=float, default=defaults.cliprange, help="PPO/GRPO/GSPO ratio clipping epsilon.")
+    parser.add_argument("--loss_normalization", type=str, choices=["sequence", "constant"], default=defaults.loss_normalization, help="Method for loss aggregation; 'sequence' averages over valid tokens in each response, then averages over responses.")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=defaults.gpu_memory_utilization, help="Fraction of GPU memory to use for vLLM, including model weights and KV cache.")
     parser.add_argument("--val_every_steps", type=int, default=defaults.val_every_steps, help="Number of training steps between each validation evaluation.")
     parser.add_argument("--val_size", type=int, default=defaults.val_size, help="Number of examples to use for validation; metrics will be computed based on these examples.")
     parser.add_argument("--eval_sampling_temperature", type=float, default=defaults.eval_sampling_temperature, help="Sampling temperature for validation generation; 0.0 indicates greedy decoding for stable comparison of results.")
@@ -240,6 +246,54 @@ def generate_rollouts(
     return repeated_prompts, rollout_responses, repeated_ground_truths
 
 
+def compute_rollout_log_probs(
+    policy: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    microbatch_size: int,
+) -> torch.Tensor:
+    """Score fixed rollout responses with the policy that generated them.
+
+    The returned tensor is the frozen ``old_log_probs`` used by off-policy
+    reweighting.  It has shape ``[batch_size, sequence_length]`` and keeps the
+    same padding/token alignment as the later training step.
+    """
+    if len(repeated_prompts) != len(rollout_responses):
+        raise ValueError("prompts and rollout responses must have equal lengths")
+    if microbatch_size <= 0:
+        raise ValueError("microbatch_size must be positive")
+
+    tokenized = tokenize_prompt_and_output(
+        repeated_prompts,
+        rollout_responses,
+        tokenizer,
+    )
+    device = next(policy.parameters()).device
+    input_ids = tokenized["input_ids"].to(device)
+    labels = tokenized["labels"].to(device)
+
+    was_training = policy.training
+    policy.eval()
+    chunks: list[torch.Tensor] = []
+    try:
+        with torch.no_grad():
+            for start in range(0, input_ids.shape[0], microbatch_size):
+                end = start + microbatch_size
+                chunks.append(
+                    get_response_log_probs(
+                        policy,
+                        input_ids[start:end],
+                        labels[start:end],
+                    )["log_probs"].detach()
+                )
+    finally:
+        if was_training:
+            policy.train()
+
+    return torch.cat(chunks, dim=0)
+
+
 # Purpose: Run GRPO updates, periodic validation, and W&B logging with initialized resources.
 # Inputs: cfg (GRPOConfig); train_batches (List of S batches, each containing P prompts and P answers);
 #         reward_fn (Callable[[str, str], dict[str, float]]); server (started VLLMServer with weight sync initialized);
@@ -254,7 +308,19 @@ def run_grpo_train_loop(
     tokenizer: PreTrainedTokenizerBase,
     optimizer: torch.optim.Optimizer,
 ) -> dict[str, Any]:
-    
+    if cfg.train_batch_size <= 0:
+        raise ValueError("train_batch_size must be positive")
+    if cfg.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if cfg.epochs_per_rollout_batch <= 0:
+        raise ValueError("epochs_per_rollout_batch must be positive")
+    if cfg.importance_reweighting_method == "none" and cfg.epochs_per_rollout_batch > 1:
+        raise ValueError(
+            "epochs_per_rollout_batch > 1 requires an off-policy reweighting method"
+        )
+    if cfg.importance_reweighting_method in {"grpo", "gspo"} and cfg.cliprange <= 0:
+        raise ValueError("cliprange must be positive for grpo/gspo")
+
     # --- W&B setup: run tracking only; this does not initialize or update the policy. ---
     run_name = cfg.wandb_run_name or f"grpo-seed-{cfg.seed}"
     # W&B API: init creates one run and records its project, name, and config.
@@ -294,7 +360,7 @@ def run_grpo_train_loop(
         for step, (prompts, ground_truth_answers) in enumerate(train_batches, start=1):
             # Use the current policy to sample fresh on-policy rollouts.
             server.sync_policy_weights(policy)
-            
+
             (
                 repeated_prompts,
                 rollout_responses,
@@ -306,24 +372,96 @@ def run_grpo_train_loop(
                 ground_truth_answers,
             )
 
-            # Training API: computes rewards/loss, accumulates gradients, and updates policy once.
-            loss, metadata = grpo_train_step(
-                model=policy,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-                max_grad_norm=cfg.max_grad_norm,
-                reward_fn=reward_fn,
-                repeated_prompts=repeated_prompts,
-                rollout_responses=rollout_responses,
-                repeated_ground_truths=repeated_ground_truths,
-                group_size=cfg.group_size,
-                baseline=cfg.baseline,
-                advantage_eps=cfg.advantage_eps,
-                advantage_normalizer=cfg.advantage_normalizer,
-                importance_reweighting_method=cfg.importance_reweighting_method,
-                loss_normalization=cfg.loss_normalization,
-            )
+            rollout_size = len(rollout_responses)
+            if rollout_size % cfg.train_batch_size != 0:
+                raise ValueError(
+                    "rollout batch size must be divisible by train_batch_size"
+                )
+            if cfg.train_batch_size % cfg.group_size != 0:
+                raise ValueError(
+                    "train_batch_size must contain complete GRPO groups"
+                )
+            if cfg.train_batch_size % cfg.gradient_accumulation_steps != 0:
+                raise ValueError(
+                    "train_batch_size must be divisible by gradient_accumulation_steps"
+                )
+
+            # Off-policy methods keep the behavior-policy probabilities fixed
+            # while reusing this same rollout batch for multiple updates.
+            old_log_probs = None
+            if cfg.importance_reweighting_method != "none":
+                if len(rollout_responses) % cfg.gradient_accumulation_steps != 0:
+                    raise ValueError(
+                        "rollout batch must divide evenly across gradient accumulation steps"
+                    )
+                old_log_probs = compute_rollout_log_probs(
+                    policy,
+                    tokenizer,
+                    repeated_prompts,
+                    rollout_responses,
+                    # Keep old-policy scoring within the same activation-sized
+                    # chunks used by the training step.
+                    microbatch_size=max(
+                        1,
+                        cfg.train_batch_size // cfg.gradient_accumulation_steps,
+                    ),
+                )
+
+            update_losses: list[torch.Tensor] = []
+            update_metadata: list[dict[str, torch.Tensor | float]] = []
+            for _ in range(cfg.epochs_per_rollout_batch):
+                for batch_start in range(0, rollout_size, cfg.train_batch_size):
+                    batch_end = batch_start + cfg.train_batch_size
+                    old_log_probs_batch = (
+                        None
+                        if old_log_probs is None
+                        else old_log_probs[batch_start:batch_end]
+                    )
+                    loss, metadata = grpo_train_step(
+                        model=policy,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+                        max_grad_norm=cfg.max_grad_norm,
+                        reward_fn=reward_fn,
+                        repeated_prompts=repeated_prompts[batch_start:batch_end],
+                        rollout_responses=rollout_responses[batch_start:batch_end],
+                        repeated_ground_truths=repeated_ground_truths[batch_start:batch_end],
+                        group_size=cfg.group_size,
+                        baseline=cfg.baseline,
+                        advantage_eps=cfg.advantage_eps,
+                        advantage_normalizer=cfg.advantage_normalizer,
+                        importance_reweighting_method=cfg.importance_reweighting_method,
+                        old_log_probs=old_log_probs_batch,
+                        cliprange=cfg.cliprange,
+                        loss_normalization=cfg.loss_normalization,
+                    )
+                    update_losses.append(loss.detach())
+                    update_metadata.append(metadata)
+
+            loss = torch.stack(update_losses).mean()
+            metadata = dict(update_metadata[-1])
+            for key in ("mean_reward", "mean_format_reward", "mean_advantage"):
+                numeric_values = [
+                    value[key]
+                    for value in update_metadata
+                    if isinstance(value.get(key), (int, float))
+                ]
+                if numeric_values:
+                    metadata[key] = sum(numeric_values) / len(numeric_values)
+            clip_values = [
+                value["clip-fraction"]
+                for value in update_metadata
+                if isinstance(value.get("clip-fraction"), torch.Tensor)
+            ]
+            if clip_values:
+                metadata["clip-fraction"] = torch.stack(clip_values).mean()
+            elif "clip-fraction" not in metadata:
+                # none/noclip do not clip, but keep a consistent W&B metric.
+                metadata["clip-fraction"] = torch.zeros(
+                    (),
+                    device=loss.device,
+                )
 
             # --- W&B logging preparation only: convert results to serializable scalars. ---
             step_metrics: dict[str, float] = {
@@ -485,7 +623,7 @@ def main():
     gsm8k_batch_builder = GSM8KBatchBuilder(cfg, prompt_template)
     train_batches = gsm8k_batch_builder.build_train_batches()
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code = True)
-    
+
     # Initialize vLLM server and Hugging Face model here (not shown)
     # For each training step, generate rollouts, compute rewards, and update the policy
     server = VLLMServer(
@@ -496,20 +634,20 @@ def main():
         seed = cfg.seed,
         gpu_memory_utilization = cfg.gpu_memory_utilization,
     )
-    
+
     policy = AutoModelForCausalLM.from_pretrained(
         cfg.model_path,
         torch_dtype = torch.bfloat16,
         trust_remote_code = True
     ).to(cfg.train_device)
-    
+
     policy.train()
-    
+
     optimizer = torch.optim.AdamW(
         policy.parameters(),
         lr = cfg.learning_rate,
     )
-    
+
     try:
         server.start()
         server.init_weight_sync(
@@ -526,5 +664,6 @@ def main():
         )
     finally:
         server.stop()
-if __name__ = "__main__":
+
+if __name__ == "__main__":
     main()
